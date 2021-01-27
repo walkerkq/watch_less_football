@@ -1,0 +1,398 @@
+---
+title: "How to watch as little football as possible"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+library(nflfastR)
+library(tidyverse)
+library(scales)
+library(gridExtra)
+source("../kp_themes/theme_kp.R")
+theme_set(theme_classic() + theme_kp())
+```
+
+```{r functions, echo = FALSE}
+score_line_plot <- function(input_game_id){
+  
+  temp <- pbp %>% filter(game_id == input_game_id)
+  
+  temp %>% 
+    select(game_seconds_remaining, total_home_score, total_away_score) %>% 
+    pivot_longer(c('total_home_score', 'total_away_score')) %>% 
+    ggplot(aes(x = game_seconds_remaining*-1/60, y = value, color = name)) + 
+    geom_line() +
+    labs(title = paste0('Score over time, ', temp$home_team, ' vs ', temp$away_team),
+         subtitle = temp$game_date,
+         y = 'score',
+         x = 'game minutes remaining') +
+    scale_x_continuous(breaks = seq(from = -60, to = 0, by = 10), labels = seq(from = 60, to = 0, by = -10)) +
+    scale_color_kp(name = 'score', palette = 'cool') +
+    theme(legend.position = 'top')
+  
+}
+
+wp_line_plot <- function(input_game_id){
+  
+  temp <- pbp %>% filter(game_id == input_game_id)
+  
+  temp %>% 
+    ggplot(aes(x = game_seconds_remaining*-1/60, y = home_wp, group = 1)) + 
+    geom_line() +
+    labs(title = paste0('Home team (', temp$home_team, ') win probability'),
+         subtitle = temp$game_date,
+         y = 'win probability (wp)',
+         x = 'game minutes remaining') +
+    scale_y_continuous(labels = scales::percent, limits = c(0,1)) +
+    scale_x_continuous(breaks = seq(from = -60, to = 0, by = 10), labels = seq(from = 60, to = 0, by = -10))
+  
+}
+
+diff_plot <- function(input_game_id){
+  
+  temp <- minute_streak %>% filter(game_id == input_game_id)
+  
+  temp %>%
+    ggplot(aes(x = minute*-1, y = differential)) + 
+    geom_line() + 
+    geom_point(aes(color = currently_leading), size = 1.5) +
+    geom_rect(xmin = max(temp$minute[temp$final_streak])*-1, xmax = Inf, ymin = -Inf, ymax = Inf, alpha = 0.01, fill = 'grey70') + 
+    annotate('text', x = max(temp$minute[temp$final_streak])*-1, y = 0, label = 'same leader until win', hjust = 0) + 
+    labs(title = 'Score differential over time',
+         subtitle = paste0(temp$home_team, ' vs ', temp$away_team, ', ', temp$game_date),
+         x = 'game minutes remaining',
+         y = 'home - away score') +
+    scale_x_continuous(breaks = seq(from = -60, to = 0, by = 10), labels = seq(from = 60, to = 0, by = -10)) +
+    scale_color_manual(values = c('#490B32', '#5DA9E9', '#B3CBB9'))
+  
+}
+
+team_2020_plot <- function(input_team){
+
+  temp <- results_2020 %>%
+    filter(home_team == input_team | away_team == input_team) %>%
+    mutate(final = case_when(minute == 0 & winner_name == input_team ~ input_team,
+                             minute == 0 & winner_name != input_team ~ 'opponent',
+                             TRUE ~ NA_character_),
+           final = factor(final, levels = c(input_team, 'opponent')))
+  
+  temp_min <- temp %>%
+    filter(exit_point) %>%
+    summarise(minutes_saved = sum(minute),
+              real_minutes_saved = sum(minute)*3,
+              pct = sum(minute)/(n()*60))
+  
+  temp %>%
+    ggplot(aes(x = minute*-1, y = ifelse(home_team == input_team, differential, differential*-1))) + 
+    geom_hline(yintercept = 0, color = 'grey60') +
+    geom_line() + 
+    geom_point(aes(color = final), size = 3) + 
+    geom_vline(aes(xintercept = ifelse(exit_point & minute > 0, minute*-1, NA)), color = 'red', lty = 2) +
+    geom_rect(aes(xmin = ifelse(exit_point & minute > 0, minute*-1, NA), xmax = Inf, ymin = -Inf, ymax = Inf), fill = kp_cols('red'), alpha = 0.1) + 
+    geom_text(aes(x = -5, y = min(differential)+5, label = ifelse(exit_point & minute > 0 & !final_streak, 'oops, lead change!', '')), cex = 2.75, color = kp_cols('red'), hjust = 1) +
+    facet_wrap(~game_id) +
+    scale_color_manual(values = c('#8ad49c', kp_cols('red'), NA), na.translate = FALSE) +
+    scale_x_continuous(breaks = seq(from = -60, to = 0, by = 10), labels = seq(from = 60, to = 0, by = -10)) +
+    labs(title = paste('When to stop watching', input_team),
+         subtitle = paste0('Could have saved yourself ', temp_min$minutes_saved, ' minutes of gameplay (', percent(temp_min$pct, accuracy = 1),  ') during the 2020 regular season'),
+         x = 'game minutes remaining', 
+         y = paste(input_team, 'score - opponent score'))
+
+}
+```
+
+With COVID rescheduling sporting events left and right, it's felt like there's a new football game on every night of the week this season. For avid football fans, this is fantastic - the games are spread apart for easier viewing and fantasy team tracking and more nights of the week have distractions from quarantine life and the news. For me, not what you would call a football "fan," this is not so bueno.  
+
+Bored of endless pass replays, timeouts and penalty disputes, I challenged my partner: what if I could use data to tell you when the game is basically decided **so that we can shut it off** and switch to our 11th viewing of Parks & Rec or whatever rapidly-produced movie Netflix is pressuring us to watch on the home screen (fully understanding these are not any better, but what can you do)??   
+
+He laughed, but conceded that it would be pretty interesting to know if there was a point of no return or a particular set of conditions that all but guarantee that the current leader would win the game. In other words, how likely is an upset if it's halfway through the 4th quarter and the home team is ahead by 21 points? (100% chance of me complaining to change the channel)  
+
+
+### Data  
+
+The R package [`nflfastR`](https://github.com/guga31bb/nflfastR-data) provides easy access to play-by-play NFL data going all the way back to 1999. We'll just focus on 2010-2020.  
+
+
+```{r load-data}
+# https://github.com/guga31bb/nflfastR-data
+
+# seasons <- 2010:2020
+# pbp <- purrr::map_df(seasons, function(x) {
+#   download.file(glue::glue("https://raw.githubusercontent.com/guga31bb/nflfastR-data/master/data/play_by_play_{x}.parquet"), "tmp.parquet")
+#   df <- arrow::read_parquet("tmp.parquet")
+#   return(df)
+# }
+# )
+
+# cols <- c('game_id', 'home_team', 'away_team', 'game_date', 'posteam', 'game_half',
+#           'game_seconds_remaining', 'total_home_score', 'total_away_score',
+#           'score_differential', 'ep', 'result', 'week', 'season', 'season_type',
+#           'home_wp', 'half_seconds_remaining', 'yardline_100', 'down', 'ydstogo',
+#           'posteam_timeouts_remaining', 'defteam_timeouts_remaining', 'wp', 'qtr')
+# 
+# write.csv(select(pbp, all_of(cols)), 'nfl_seasons_2010_2020.csv', row.names = FALSE)
+
+pbp <- read.csv('nfl_seasons_2010_2020.csv')
+```
+
+The data contains more than 300 features for each play, including the quarter/half/game seconds remaining, down, yardline, yards to go, side of the field, possession team, yards gained, play type, pass length, air yards, kick distance, timeouts remaining, score, and so on. The creators of the R package also [fit models](https://www.opensourcefootball.com/posts/2020-09-28-nflfastr-ep-wp-and-cp-models/) to calculate various estimates and probabilities for each play, including expected points, completion probability, expected yards after catch, expected pass, and win probability.  
+
+
+```{r line-plots, fig.width = 10, fig.height = 5}
+grid.arrange(score_line_plot('2019_01_ATL_MIN'), wp_line_plot('2019_01_ATL_MIN'), ncol = 2)
+grid.arrange(score_line_plot('2019_01_BUF_NYJ'), wp_line_plot('2019_01_BUF_NYJ'), ncol = 2)
+```
+  
+#### Understanding win probability   
+
+What features contribute to the win probability (WP) at each play? The authors list predictors as: time remaining in the half and the game, the yard line, score differential (spread), down, yards to go, timeouts remaining, whether the team will receive the 2nd half kickoff, whether the possession team is at home, and a ratio of expected score to time remaining. They used decision trees to fit the models; without recreating the full model, we can do a little detective work to understand which features were most important in predicting which team would win.  
+
+```{r find-importance, fig.width = 8, fig.height = 5}
+
+# https://www.opensourcefootball.com/posts/2020-09-28-nflfastr-ep-wp-and-cp-models/
+model <- pbp %>% 
+  filter(season != '2020') %>%
+  mutate(receive_h2_ko = ifelse(posteam == away_team & game_half == 'Half1', 1, 0),
+         posteam_is_home = ifelse(posteam == home_team, 1, 0),
+         ep_tr_ratio = (ep + score_differential)/(game_seconds_remaining + 1)) %>%
+  filter(qtr <= 4) %>%
+  select(c('half_seconds_remaining', 'game_seconds_remaining', 'yardline_100', 'down', 'ydstogo',
+                 'posteam_timeouts_remaining', 'defteam_timeouts_remaining', 'ep', 'score_differential',
+                 'receive_h2_ko', 'posteam_is_home', 'ep_tr_ratio', 'wp')) 
+
+
+fit <- lm(wp ~ ., data = model)
+
+anova(fit) %>%
+  as.data.frame() %>% 
+  mutate(term = row.names(anova(fit))) %>%
+  filter(term!= 'NULL') %>%
+  mutate(pct_sum_sq = `Sum Sq`/sum(`Sum Sq`)) %>%
+  ggplot(aes(y = reorder(term, pct_sum_sq, max), x = `Sum Sq`)) + 
+  geom_col() +
+  geom_text(aes(label = scales::percent(pct_sum_sq, accuracy = 0.1)), cex = 2.75, hjust = -0.1) +
+  labs(title = 'Relative importance of input features on WP',
+       x = 'sum of squares', 
+       y = '') +
+  scale_x_continuous(limits = c(0,35000))
+
+```
+
+According to a quick linear regression on the 2010-2019 seasons, the most important predictor was the score differential (possession team score - defense team score) by a landslide. I think that's enough for us to just focus on `score_differential` for simplicity.  
+
+#### How much of a point lead means the game is basically over?    
+
+First, let's reduce the data set to the last play for each minute of gameplay, and calculate the differential between the home and away score, and whether or not that team is the ultimate winner.  
+
+```{r streak, fig.width = 12, fig.height = 5}
+# reduce to first play per minute of the game
+minute_agg <- pbp %>%
+  filter(!is.na(game_seconds_remaining)) %>%
+  mutate(winner = ifelse(result >= 0, 'home', 'away'),
+         differential = total_home_score - total_away_score,
+         currently_leading = case_when(total_home_score - total_away_score > 0 ~ 'home',
+                                       total_home_score - total_away_score < 0 ~ 'away',
+                                       TRUE ~ 'tie'),
+         accurate = winner == currently_leading,
+         minute = floor((game_seconds_remaining + 1)/60)) %>%
+  group_by(game_id, minute) %>%
+  arrange(desc(game_seconds_remaining)) %>%
+  mutate(minute_order = n():1) %>%
+  ungroup() %>%
+  filter(minute_order == 1) %>%
+  select(game_id, game_date, week, season, season_type,
+         home_team, away_team, winner, minute, 
+         total_home_score, total_away_score, differential,
+         currently_leading, accurate, home_wp)
+
+```
+
+Next, we can compare the leading team to the final winner at each minute of the game. We're looking for the point in time where the leading team becomes the winner, or the point in time where the leading team never switches again. We can do this by finding each streak (series of minutes where a team is leading) and look for the "last" streak or the one that terminates with the end of the game.  
+
+```{r streak-2, fig.width = 12, fig.height = 5}
+minute_streak <- minute_agg %>%
+  group_by(game_id) %>%
+  arrange(desc(minute)) %>%
+  mutate(streak_start = accurate != lag(accurate) & accurate) %>%
+  #filter(minute < 60) %>%
+  mutate(streak_start = ifelse(accurate & minute == 59 & !streak_start, TRUE, streak_start),
+         streak_id = cumsum(streak_start),
+         streak_id = ifelse(!accurate, 0, streak_id),
+         final_streak = streak_id == max(streak_id)) %>%
+  ungroup() %>%
+  arrange(game_id, desc(minute)) 
+
+grid.arrange(score_line_plot('2019_19_MIN_SF'), diff_plot('2019_19_MIN_SF'), ncol = 2)
+grid.arrange(score_line_plot('2019_19_SEA_GB'), diff_plot('2019_19_SEA_GB'), ncol = 2)
+```
+
+In the MIN vs. SF game, the "final" streak started just before half time, when SF scored a second touchdown to take the lead and remained in the lead until the game ended. In the GB vs. SEA game, Green Bay took the lead five minutes into the first quarter and never lost it. 
+
+What does this look like in aggregate? In other words, if there is a 7 point score differential with 55 minutes remaining, what percentage of games saw the leading team maintain the lead for the entirety of the game? Or the reverse: what percentage of games saw a lead change or comeback? Here's the outcome from `r filter(minute_streak, season_type == 'REG' & season != '2020') %>% select(game_id) %>% unique() %>% nrow() %>% comma()` regular season games played from 2010 to 2019 based on the score differential at various points in time during the game.  
+
+
+```{r tile-plot, fig.width = 8, fig.height = 6}
+reg_plot <- minute_streak %>% 
+  filter(minute %in% seq(from = 5, to = 60, by = 5),
+         season_type == 'REG',
+         season != '2020') %>%
+  mutate(abs_differential = abs(differential),
+         minute = as.factor(minute)) %>%
+  group_by(minute, abs_differential, final_streak) %>% 
+  count() %>% 
+  group_by(minute, abs_differential) %>% 
+  mutate(pct = n/sum(n),
+         total = sum(n)) %>%
+  ungroup() 
+
+reg_plot %>%
+  filter(final_streak, 
+         total >= 10,
+         abs_differential %in% c(3,4,7,10,14,21,28)) %>% 
+  ggplot(aes(x = as.numeric(as.character(minute))*-1, y = as.factor(abs_differential), fill = pct)) + 
+  geom_tile() +
+  geom_text(aes(label = percent(pct, accuracy = 1)), cex = 3, color = 'white') +
+  labs(title = 'The point of no return',
+       subtitle = 'NFL regular season games, 2010-2019',
+       x = 'game minutes remaining',
+       y = 'score differential') +
+  scale_x_continuous(breaks = seq(from = -55, to = -5, by = 5), labels = seq(from = 55, to = 5, by = -5)) +
+  scale_fill_gradientn(colors = c(kp_cols('blue'),  kp_cols('purple')), 
+                       values = c(0, 0.7, 1),
+                       name = '% of games where current leader maintained lead') +
+  scale_color_manual(values = c('red', 'green')) +
+  theme(legend.position = 'top')
+```
+
+With a 7-point score differential and 55 minutes left to play, `r reg_plot %>% filter(final_streak, abs_differential == 7, minute == 55) %>% pull(pct) %>% percent()` of regular season games played 2010-2019 saw the leading team maintain that lead for the entire game. YAWN. 
+
+Let's say you want to be 90% sure you won't miss a comeback. Based on the historical percent of games where no further lead change happened, you could stop watching if there was 28-point lead at any point, a 21-point lead in the second half, or a 14-point lead with 10 minutes or less to play. Let's apply that rule to the 2020 season and see how much we would have missed (and how many hours you'd get back).  
+
+```{r check-2020, fig.width = 10, fig.height = 6}
+results_2020 <- minute_streak %>%
+  filter(season_type == 'REG',
+         season == '2020') %>%
+  mutate(watch_decision = case_when(abs(differential) >= 28 ~ 'stop',
+                                   abs(differential) >= 21 & minute <= 30 ~ 'stop',
+                                   abs(differential) >= 14 & minute <= 15 ~ 'stop',
+                                   TRUE ~ 'keep')
+         ) %>% 
+  group_by(game_id) %>%
+  arrange(desc(watch_decision), desc(minute)) %>%
+  # exit at first "stop" point, or at the final minute of the game if there is no "stop"
+  mutate(any_stops = any(watch_decision == 'stop'),
+         exit_point = ifelse(any_stops, row_number() == 1, row_number() == n())) %>%
+  ungroup() %>%
+  mutate(winner_name = ifelse(winner == 'home', home_team, away_team),
+         team_id = home_team)
+
+
+results_2020_summary <- results_2020 %>%
+  filter(exit_point) %>%
+  summarise(games_exited_early = sum(ifelse(minute>0, 1, 0)),
+            games_exited_w_comeback = sum(ifelse(minute>0 & !final_streak, 1, 0)),
+            games_exited_w_comeback_still_won = sum(ifelse(minute>0 & !final_streak & accurate, 1, 0)),
+            total_games = n_distinct(game_id),
+            minutes_saved = sum(minute),
+            total_minutes = n_distinct(game_id)*60) %>%
+  mutate(pct_comeback = games_exited_w_comeback/games_exited_early,
+         pct_exited = games_exited_early/total_games,
+         pct_minutes_saved = minutes_saved/total_minutes)
+```
+
+**You could have saved `r comma(results_2020_summary$minutes_saved)` minutes of gameplay (`r round(results_2020_summary$minutes_saved/60, 1)` hours, which is like x3 = `r round(results_2020_summary$minutes_saved*3/60, 1)` real hours) of time by turning off `r results_2020_summary$games_exited_early` games when the point differential got crazy.** That's `r percent(results_2020_summary$pct_minutes_saved, accuracy = 0.1)` of total gameplay minutes from `r percent(results_2020_summary$pct_exited, accuracy = 0.1)` of total games in this season.  
+
+Not only could you watch the entire series of Parks and Rec (42.6 hours) twice over, but you would have only missed `r results_2020_summary$games_exited_w_comeback` games where the leading team didn't keep the lead for every remaining minute. Of the games you could have stopped watching early, you would have basically missed NOTHING in `r percent(1-results_2020_summary$pct_comeback, accuracy = 0.1)` of them. Plus, in `r results_2020_summary$games_exited_w_comeback_still_won` of those `r results_2020_summary$games_exited_w_comeback` games, the team winning when you changed the channel got the lead back and then went on to win anyway.      
+
+You probably weren't trying to watch 100% of each of the `r pbp %>% filter(season == '2020') %>% summarise(n = n_distinct(game_id)) %>% pull(n)` games in this season, but maybe just your favorite team's games. How did they fare? Were the games close enough to watch the full thing, or were they boring blowouts?  
+
+
+
+```{r teams, fig.width = 12, fig.height = 8}
+
+# bind df to itself so each game exists for both players
+results_2020_by_team <- results_2020 %>%
+  mutate(team_id = away_team) %>%
+  bind_rows(results_2020) %>%
+  filter(exit_point) %>%
+  group_by(team_id) %>%
+  summarise(games_exited_early = sum(ifelse(minute>0, 1, 0)),
+            games_exited_w_comeback = sum(ifelse(minute>0 & !final_streak, 1, 0)),
+            games_exited_w_comeback_still_won = sum(ifelse(minute>0 & !final_streak & accurate, 1, 0)),
+            games_exited_early_team_lost = sum(ifelse(winner_name != team_id, 1, 0)),
+            games_exited_early_team_won = sum(ifelse(winner_name == team_id, 1, 0)),
+            total_games = n_distinct(game_id),
+            minutes_saved = sum(minute),
+            minutes_saved_lost = sum(ifelse(winner_name != team_id, minute, 0)),
+            minutes_saved_won = sum(ifelse(winner_name == team_id, minute, 0)),
+            total_minutes = n_distinct(game_id)*60,
+            .groups = 'drop') %>%
+  mutate(pct_comeback = games_exited_w_comeback/games_exited_early,
+         pct_exited = games_exited_early/total_games,
+         pct_minutes_saved = minutes_saved/total_minutes,
+         pct_minutes_saved_lost = minutes_saved_lost/total_minutes,
+         pct_minutes_saved_won = minutes_saved_won/total_minutes)
+
+results_2020_by_team_and_outcome <- results_2020 %>%
+  mutate(team_id = away_team) %>%
+  bind_rows(results_2020) %>%
+  filter(exit_point) %>%
+  mutate(game_outcome = case_when(winner_name == team_id & final_streak ~ 'win (expected)',
+                                  winner_name == team_id & !final_streak ~ 'win (comeback)',
+                                  winner_name != team_id & final_streak ~ 'loss (expected)',
+                                  winner_name != team_id & !final_streak ~ 'loss (surprise)')) %>%
+  group_by(team_id) %>%
+  mutate(total_minutes = n_distinct(game_id)*60,
+         total_games = n_distinct(game_id)) %>%
+  group_by(team_id, game_outcome, total_minutes, total_games) %>%
+  summarise(minutes_saved = sum(minute),
+            games_exited = sum(ifelse(minute>0, 1, 0)),
+            .groups = 'drop') %>%
+  mutate(pct_minutes_saved = minutes_saved/total_minutes,
+         pct_games_exited = games_exited/total_games) 
+
+
+team1 <- results_2020_by_team_and_outcome %>%
+  group_by(team_id) %>% 
+  summarise(pct_minutes_saved = sum(pct_minutes_saved),
+            .groups = 'drop') %>%
+  ggplot(aes(y = reorder(team_id, pct_minutes_saved, sum), x = pct_minutes_saved)) +
+  geom_col(fill = kp_cols('purple')) +
+  geom_text(aes(label = percent(pct_minutes_saved, accuracy = 0.1)), cex = 2.75, hjust = 1, color = 'white', fontface = 'bold') + 
+  labs(title = "Gameplay minutes you didn't have to watch",
+       subtitle = 'NFL regular season games, 2020',
+       x = "% of minutes saved",
+       y = '') +
+  scale_x_continuous(labels = scales::percent, limits = c(0, .3))
+
+team2 <- results_2020_by_team_and_outcome %>%
+  ggplot(aes(y = reorder(team_id, pct_minutes_saved, sum), x = games_exited, fill = game_outcome)) +
+  geom_col() +
+  labs(title = "Games you didn't have to finish, by outcome",
+       subtitle = 'NFL regular season games, 2020',
+       x = 'count games ended early',
+       y = '') +
+  scale_fill_kp(reverse = TRUE) +
+  scale_x_continuous(breaks = c(2,4,6,8,10,12))
+
+gridExtra::grid.arrange(team1, team2, ncol = 2)
+
+```
+
+```{r by-team, fig.width = 10, fig.height = 6}
+teams <- results_2020 %>%
+  pull(home_team) %>%
+  unique() %>%
+  sort()
+
+
+for (i in seq_along(teams)) {
+  
+  print(team_2020_plot(teams[i]))
+  
+}
+
+```
+
+
